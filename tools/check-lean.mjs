@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // THE CHECKER. Nothing else can mark a lemma checked or refuted.
 //
-//   node tools/check-lean.mjs <lean file> <statement file> [check|refute]
+//   node tools/check-lean.mjs <lean file> <statement file> [check|refute|reduce]
 //
 // Exit 0 ONLY when all of these hold, each read from the compiled result:
 //   1. the file builds in the pinned environment (lean/lean-toolchain, lean/lake-manifest.json);
@@ -11,6 +11,15 @@
 //   4. the theorem is a proof of the recorded statement (of its negation for `refute`), where the
 //      statement is read against the pinned library and the definitions root (PEqualNP.Defs)
 //      and nothing else of this project, whatever the file imports.
+//   For `reduce` (the decomposition door, ships dark): the theorem is T1 → ... → Tk → S with
+//   2 ≤ k ≤ 4 non-dependent arrows, S structurally the recorded statement, each Ti a closed
+//   proposition of the statement environment, distinct, not S, not False, and the file declares
+//   nothing but the theorem. The verifier prints one `CHILD <i> <text>` line per child (Lean's own
+//   printing, checked to read back to the same term); they are carried out unchanged.
+//   A child with a string or name literal, a text type (String, Char, Lean.Name, ...) among its
+//   constants, a constant of Lean's meta namespaces (Lean, Std.Format, IO, ...) under it, a
+//   metadata node, or more than 2000 printed characters is refused (reduce-child); one that contains
+//   S as a subterm or that `decide` evaluates to false is refused (reduce-waste).
 // On acceptance it prints, before the last line, one line recorded with the result:
 //   MANIFEST {"rests_on":[{"module","sha256"}...],"defs":[{"module","sha256"}...]}
 // the source hash of every project module the theorem rests on and of every module of the
@@ -39,8 +48,9 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync,
 import { tmpdir } from 'node:os';
 import { dirname, join, relative, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { counterRose, diedOfMemory, oomKills } from './check-lean-memory.mjs';
 
-export const CHECKER_VERSION = 'check-lean 3';   // 2026-11-22: stricter (one name, one meaning; fixed inputs; faults told apart from rejections)
+export const CHECKER_VERSION = 'check-lean 4';   // 2026-11-24: kind reduce (decomposition door, dark), with the text and waste screens on its children
 const DEFS_ROOT = 'PEqualNP.Defs';
 const CHECKER_LEAN_DIR = join(dirname(dirname(fileURLToPath(import.meta.url))), 'lean');
 const LEAN_DIR = process.env.PEQUALNP_REPO_ROOT ? join(process.env.PEQUALNP_REPO_ROOT, 'lean') : CHECKER_LEAN_DIR;
@@ -60,14 +70,18 @@ const writeAll = (fd, text) => {
 };
 const out = (line) => writeAll(1, `${line}\n`);
 const fault = (msg) => { writeAll(2, `CHECKER FAULT: ${msg}\n`); process.exit(3); };
+// Progress, one fixed line per stage on stderr (our words only, never the file's), so a run that
+// stops making progress shows where it stood (2026-11-24: eleven runs hung in this step).
+const T0 = Date.now();
+const stage = (name) => writeAll(2, `checker stage: ${name} t=${Math.round((Date.now() - T0) / 1000)}s\n`);
 const reject = (cls, msg) => { out(`REJECTED (${cls}): ${msg}`); process.exit(1); };
 // Anything this script did not foresee is a fault of the checker, never a verdict on the proof.
 process.on('uncaughtException', (e) => fault(`the checker stopped on an error of its own: ${e?.message ?? e}`));
 const sha256 = (bytes) => createHash('sha256').update(bytes).digest('hex');
 
 const [file, statement, kind = 'check'] = process.argv.slice(2);
-if (!file || !statement) fault('usage: node tools/check-lean.mjs <lean file> <statement file> [check|refute]');
-if (kind !== 'check' && kind !== 'refute') fault(`kind must be check or refute, got "${kind}"`);
+if (!file || !statement) fault('usage: node tools/check-lean.mjs <lean file> <statement file> [check|refute|reduce]');
+if (kind !== 'check' && kind !== 'refute' && kind !== 'reduce') fault(`kind must be check, refute or reduce, got "${kind}"`);
 if (!existsSync(file)) fault(`the lemma file ${file} does not exist`);
 if (!existsSync(statement)) fault(`the statement file ${statement} does not exist`);
 // The recorded statement, as it is now. Nothing that runs later can change what is judged.
@@ -104,6 +118,7 @@ if (!existsSync(join(LEAN_DIR, '.lake', 'packages', 'mathlib', '.lake', 'build',
   fault('the prebuilt Mathlib cache is missing. Run `lake exe cache get` in lean/ (RUNBOOK.md, section 2).');
 }
 
+stage('started');
 // One build at a time in this directory.
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 for (;;) {
@@ -113,6 +128,7 @@ for (;;) {
     if (age > LOCK_STALE_MS) { try { rmdirSync(LOCK); } catch { /* another run took it */ } } else sleep(500);
   }
 }
+stage('build lock taken');
 const unlock = () => { try { rmdirSync(LOCK); } catch { /* already gone */ } };
 process.on('exit', unlock);
 for (const s of ['SIGINT', 'SIGTERM']) process.on(s, () => process.exit(3));
@@ -138,6 +154,7 @@ const lakeNow = (args) => spawnSync(SHIM, args, opts(LEAN_DIR, { ...lakeEnv, PEQ
 const tail = (r, n = 30) => (r.stdout + r.stderr).trim().split('\n').slice(-n).join('\n');
 
 // The verifier is part of the checker: built from this repository, by the pinned toolchain.
+stage('building the verifier');
 const exe = lakeIn(CHECKER_LEAN_DIR, ['build', 'checklemma']);
 if (exe.error || exe.status !== 0) fault(`the verifier did not build.\n${exe.error?.message ?? tail(exe)}`);
 // The verifier that judges is the one that was just built: the same bytes before the judged
@@ -146,13 +163,26 @@ const VERIFIER = join(CHECKER_LEAN_DIR, '.lake', 'build', 'bin', 'checklemma');
 const verifierHash = sha256(readFileSync(VERIFIER));
 
 // 1. The file builds in the pinned environment, and so does the definitions root.
+stage('building the file and the definitions root');
+const killsBefore = oomKills();
 const build = lake(['build', `+${module}`, `+${DEFS_ROOT}`]);
 if (build.error) fault(`the build could not run: ${build.error.message}`);
 if (build.status !== 0) {
   // "Does not compile" is a verdict on the file only when Lean reported an error in a project
   // source file. A build that failed any other way is a fault, and says nothing of the proof.
   const inSource = new RegExp(`^error: (\\./)?(${LIBRARIES.join('|')})[/A-Za-z0-9_]*\\.lean:`, 'm');
-  if (build.status === null || !inSource.test(build.stdout + build.stderr)) fault(`the build failed for a reason that is not an error in a project file.\n${tail(build)}`);
+  // A build killed at the memory limit is a MEMORY ending (exit 137, as the workflow's own memory
+  // watch): the intake sends 137 to a larger runner. An error in a project file stays does-not-compile
+  // unless the KERNEL counter rose (printed text never overrides it: the file controls its own output).
+  const killsAfter = oomKills();
+  const all = build.stdout + build.stderr;
+  const memory = () => {
+    writeAll(2, `CHECKER MEMORY: the build was killed for memory (out of memory at the checker's limit); this says nothing of the proof.\n${tail(build)}\n`);
+    process.exit(137);
+  };
+  const projectError = build.status !== null && inSource.test(all);
+  if (projectError ? counterRose(killsBefore, killsAfter) : diedOfMemory({ output: all, killsBefore, killsAfter })) memory();
+  if (!projectError) fault(`the build failed for a reason that is not an error in a project file.\n${tail(build)}`);
   out(tail(build));
   reject('does-not-compile', `${module} does not build in the pinned environment`);
 }
@@ -171,6 +201,7 @@ const PRIVATE = mkdtempSync(join(tmpdir(), 'pequalnp-check-'));
 process.on('exit', () => { try { rmSync(PRIVATE, { recursive: true, force: true }); } catch { /* gone */ } });
 const statementCopy = join(PRIVATE, 'statement.lean');
 writeFileSync(statementCopy, statementBytes, { mode: 0o400 });
+stage('verifier reading the built file');
 const verify = lakeNow(['env', VERIFIER, module, statementCopy, kind]);
 if (verify.error) fault(`the verifier could not run: ${verify.error.message}`);
 if (!readFileSync(statementCopy).equals(statementBytes)) fault('the private copy of the statement changed while the verifier ran. Nothing was judged.');
